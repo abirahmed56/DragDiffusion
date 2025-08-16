@@ -366,19 +366,18 @@ class DragPipeline(StableDiffusionPipeline):
     def modify_unet_forward(self):
         self.unet.forward = override_forward(self.unet)
 
-    def inv_step(
-        self,
-        model_output: torch.FloatTensor,
-        timestep: int,
-        x: torch.FloatTensor,
-        eta=0.,
-        verbose=False
-    ):
-        """
-        Inverse sampling for DDIM Inversion
-        """
+    def inv_step(self, model_output, timestep, x, eta=0., verbose=False):
         if verbose:
             print("timestep: ", timestep)
+        # Extract tensor from model output object
+        if hasattr(model_output, "sample"):
+            model_output = model_output.sample  # <-- Extract tensor here
+        elif hasattr(model_output, "pred_noise"):
+            model_output = model_output.pred_noise
+        else:
+            # If you know the structure, adjust accordingly or raise error
+            raise ValueError("Unknown model_output type or missing tensor attribute")
+
         next_step = timestep
         timestep = min(timestep - self.scheduler.config.num_train_timesteps // self.scheduler.num_inference_steps, 999)
         alpha_prod_t = self.scheduler.alphas_cumprod[timestep] if timestep >= 0 else self.scheduler.final_alpha_cumprod
@@ -537,6 +536,7 @@ class DragPipeline(StableDiffusionPipeline):
                 encoder_hidden_states=encoder_hidden_states,
                 )
             if guidance_scale > 1.0:
+                noise_pred = noise_pred.sample
                 noise_pred_uncon, noise_pred_con = noise_pred.chunk(2, dim=0)
                 noise_pred = noise_pred_uncon + guidance_scale * (noise_pred_con - noise_pred_uncon)
             # compute the previous noise sample x_t -> x_t-1
@@ -612,6 +612,7 @@ class DragPipeline(StableDiffusionPipeline):
                 encoder_hidden_states=encoder_hidden_states,
                 )
             if guidance_scale > 1.:
+                noise_pred = noise_pred.sample
                 noise_pred_uncon, noise_pred_con = noise_pred.chunk(2, dim=0)
                 noise_pred = noise_pred_uncon + guidance_scale * (noise_pred_con - noise_pred_uncon)
             # compute the previous noise sample x_t-1 -> x_t
