@@ -359,7 +359,6 @@ def override_forward(self):
 
     return forward
 
-
 class DragPipeline(StableDiffusionPipeline):
 
     # must call this function when initialize
@@ -369,13 +368,11 @@ class DragPipeline(StableDiffusionPipeline):
     def inv_step(self, model_output, timestep, x, eta=0., verbose=False):
         if verbose:
             print("timestep: ", timestep)
-        # Extract tensor from model output object
         if hasattr(model_output, "sample"):
-            model_output = model_output.sample  # <-- Extract tensor here
+            model_output = model_output.sample
         elif hasattr(model_output, "pred_noise"):
             model_output = model_output.pred_noise
         else:
-            # If you know the structure, adjust accordingly or raise error
             raise ValueError("Unknown model_output type or missing tensor attribute")
 
         next_step = timestep
@@ -388,15 +385,7 @@ class DragPipeline(StableDiffusionPipeline):
         x_next = alpha_prod_t_next**0.5 * pred_x0 + pred_dir
         return x_next, pred_x0
 
-    def step(
-        self,
-        model_output: torch.FloatTensor,
-        timestep: int,
-        x: torch.FloatTensor,
-    ):
-        """
-        predict the sample of the next step in the denoise process.
-        """
+    def step(self, model_output: torch.FloatTensor, timestep: int, x: torch.FloatTensor):
         prev_timestep = timestep - self.scheduler.config.num_train_timesteps // self.scheduler.num_inference_steps
         alpha_prod_t = self.scheduler.alphas_cumprod[timestep]
         alpha_prod_t_prev = self.scheduler.alphas_cumprod[prev_timestep] if prev_timestep > 0 else self.scheduler.final_alpha_cumprod
@@ -409,11 +398,10 @@ class DragPipeline(StableDiffusionPipeline):
     @torch.no_grad()
     def image2latent(self, image):
         DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-        if type(image) is Image:
+        if isinstance(image, Image.Image):
             image = np.array(image)
             image = torch.from_numpy(image).float() / 127.5 - 1
             image = image.permute(2, 0, 1).unsqueeze(0).to(DEVICE)
-        # input image density range [-1, 1]
         latents = self.vae.encode(image)['latent_dist'].mean
         latents = latents * 0.18215
         return latents
@@ -428,19 +416,16 @@ class DragPipeline(StableDiffusionPipeline):
             image = (image * 255).astype(np.uint8)
         elif return_type == "pt":
             image = (image / 2 + 0.5).clamp(0, 1)
-
         return image
 
     def latent2image_grad(self, latents):
         latents = 1 / 0.18215 * latents
         image = self.vae.decode(latents)['sample']
-
-        return image  # range [-1, 1]
+        return image
 
     @torch.no_grad()
     def get_text_embeddings(self, prompt):
         DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-        # text embeddings
         text_input = self.tokenizer(
             prompt,
             padding="max_length",
@@ -450,23 +435,13 @@ class DragPipeline(StableDiffusionPipeline):
         text_embeddings = self.text_encoder(text_input.input_ids.to(DEVICE))[0]
         return text_embeddings
 
-    # get all intermediate features and then do bilinear interpolation
-    # return features in the layer_idx list
-    def forward_unet_features(
-        self,
-        z,
-        t,
-        encoder_hidden_states,
-        layer_idx=[0],
-        interp_res_h=256,
-        interp_res_w=256):
+    def forward_unet_features(self, z, t, encoder_hidden_states, layer_idx=[0], interp_res_h=256, interp_res_w=256):
         unet_output, all_intermediate_features = self.unet(
             z,
             t,
             encoder_hidden_states=encoder_hidden_states,
             return_intermediates=True
-            )
-
+        )
         all_return_features = []
         for idx in layer_idx:
             feat = all_intermediate_features[idx]
@@ -476,70 +451,43 @@ class DragPipeline(StableDiffusionPipeline):
         return unet_output, return_features
 
     @torch.no_grad()
-    def __call__(
-        self,
-        prompt,
-        encoder_hidden_states=None,
-        batch_size=1,
-        height=512,
-        width=512,
-        num_inference_steps=50,
-        num_actual_inference_steps=None,
-        guidance_scale=7.5,
-        latents=None,
-        neg_prompt=None,
-        return_intermediates=False,
-        **kwds):
+    def __call__(self, prompt, encoder_hidden_states=None, batch_size=1, height=512, width=512,
+                 num_inference_steps=50, num_actual_inference_steps=None, guidance_scale=7.5,
+                 latents=None, neg_prompt=None, return_intermediates=False, use_null_text=False, **kwds):
         DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-
         if encoder_hidden_states is None:
             if isinstance(prompt, list):
                 batch_size = len(prompt)
-            elif isinstance(prompt, str):
-                if batch_size > 1:
-                    prompt = [prompt] * batch_size
-            # text embeddings
+            elif isinstance(prompt, str) and batch_size > 1:
+                prompt = [prompt] * batch_size
             encoder_hidden_states = self.get_text_embeddings(prompt)
 
-        # define initial latents if not predefined
         if latents is None:
             latents_shape = (batch_size, self.unet.in_channels, height//8, width//8)
             latents = torch.randn(latents_shape, device=DEVICE, dtype=self.vae.dtype)
 
-        # unconditional embedding for classifier free guidance
+        # null-text / classifier-free guidance
         if guidance_scale > 1.:
-            if neg_prompt:
-                uc_text = neg_prompt
+            if use_null_text:
+                uc_text = [""] * batch_size
             else:
-                uc_text = ""
-            unconditional_embeddings = self.get_text_embeddings([uc_text]*batch_size)
+                uc_text = [neg_prompt]*batch_size if neg_prompt else [""]*batch_size
+            unconditional_embeddings = self.get_text_embeddings(uc_text)
             encoder_hidden_states = torch.cat([unconditional_embeddings, encoder_hidden_states], dim=0)
 
         print("latents shape: ", latents.shape)
-        # iterative sampling
         self.scheduler.set_timesteps(num_inference_steps)
-        # print("Valid timesteps: ", reversed(self.scheduler.timesteps))
         if return_intermediates:
             latents_list = [latents]
         for i, t in enumerate(tqdm(self.scheduler.timesteps, desc="DDIM Sampler")):
             if num_actual_inference_steps is not None and i < num_inference_steps - num_actual_inference_steps:
                 continue
-
+            model_inputs = torch.cat([latents]*2) if guidance_scale > 1. else latents
+            noise_pred = self.unet(model_inputs, t, encoder_hidden_states=encoder_hidden_states)
             if guidance_scale > 1.:
-                model_inputs = torch.cat([latents] * 2)
-            else:
-                model_inputs = latents
-            # predict the noise
-            noise_pred = self.unet(
-                model_inputs,
-                t,
-                encoder_hidden_states=encoder_hidden_states,
-                )
-            if guidance_scale > 1.0:
                 noise_pred = noise_pred.sample
                 noise_pred_uncon, noise_pred_con = noise_pred.chunk(2, dim=0)
                 noise_pred = noise_pred_uncon + guidance_scale * (noise_pred_con - noise_pred_uncon)
-            # compute the previous noise sample x_t -> x_t-1
             latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
             if return_intermediates:
                 latents_list.append(latents)
@@ -550,39 +498,26 @@ class DragPipeline(StableDiffusionPipeline):
         return image
 
     @torch.no_grad()
-    def invert(
-        self,
-        image: torch.Tensor,
-        prompt,
-        encoder_hidden_states=None,
-        num_inference_steps=50,
-        num_actual_inference_steps=None,
-        guidance_scale=7.5,
-        eta=0.0,
-        return_intermediates=False,
-        **kwds):
-        """
-        invert a real image into noise map with determinisc DDIM inversion
-        """
+    def invert(self, image: torch.Tensor, prompt, encoder_hidden_states=None, num_inference_steps=50,
+               num_actual_inference_steps=None, guidance_scale=7.5, eta=0.0, return_intermediates=False,
+               use_null_text=False, **kwds):
         DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         batch_size = image.shape[0]
+
         if encoder_hidden_states is None:
-            if isinstance(prompt, list):
-                if batch_size == 1:
-                    image = image.expand(len(prompt), -1, -1, -1)
-            elif isinstance(prompt, str):
-                if batch_size > 1:
-                    prompt = [prompt] * batch_size
+            if isinstance(prompt, list) and batch_size == 1:
+                image = image.expand(len(prompt), -1, -1, -1)
+            elif isinstance(prompt, str) and batch_size > 1:
+                prompt = [prompt] * batch_size
             encoder_hidden_states = self.get_text_embeddings(prompt)
 
-        # define initial latents
         latents = self.image2latent(image)
 
-        # unconditional embedding for classifier free guidance
+        # null-text / classifier-free guidance
         if guidance_scale > 1.:
-            max_length = text_input.input_ids.shape[-1]
+            uc_text = [""]*batch_size if use_null_text else [""]*batch_size
             unconditional_input = self.tokenizer(
-                [""] * batch_size,
+                uc_text,
                 padding="max_length",
                 max_length=77,
                 return_tensors="pt"
@@ -591,37 +526,22 @@ class DragPipeline(StableDiffusionPipeline):
             encoder_hidden_states = torch.cat([unconditional_embeddings, encoder_hidden_states], dim=0)
 
         print("latents shape: ", latents.shape)
-        # interative sampling
         self.scheduler.set_timesteps(num_inference_steps)
-        print("Valid timesteps: ", reversed(self.scheduler.timesteps))
-        # print("attributes: ", self.scheduler.__dict__)
         latents_list = [latents]
         pred_x0_list = [latents]
         for i, t in enumerate(tqdm(reversed(self.scheduler.timesteps), desc="DDIM Inversion")):
             if num_actual_inference_steps is not None and i >= num_actual_inference_steps:
                 continue
-
-            if guidance_scale > 1.:
-                model_inputs = torch.cat([latents] * 2)
-            else:
-                model_inputs = latents
-
-            # predict the noise
-            noise_pred = self.unet(model_inputs,
-                t,
-                encoder_hidden_states=encoder_hidden_states,
-                )
+            model_inputs = torch.cat([latents]*2) if guidance_scale > 1. else latents
+            noise_pred = self.unet(model_inputs, t, encoder_hidden_states=encoder_hidden_states)
             if guidance_scale > 1.:
                 noise_pred = noise_pred.sample
                 noise_pred_uncon, noise_pred_con = noise_pred.chunk(2, dim=0)
                 noise_pred = noise_pred_uncon + guidance_scale * (noise_pred_con - noise_pred_uncon)
-            # compute the previous noise sample x_t-1 -> x_t
             latents, pred_x0 = self.inv_step(noise_pred, t, latents)
             latents_list.append(latents)
             pred_x0_list.append(pred_x0)
 
         if return_intermediates:
-            # return the intermediate laters during inversion
-            # pred_x0_list = [self.latent2image(img, return_type="pt") for img in pred_x0_list]
             return latents, latents_list
         return latents
